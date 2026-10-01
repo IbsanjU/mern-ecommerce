@@ -13,24 +13,33 @@ const { ROLES, CART_ITEM_STATUS } = require('../../constants');
 
 router.post('/add', auth, async (req, res) => {
   try {
-    const cart = req.body.cartId;
-    const total = req.body.total;
     const user = req.user._id;
 
-    const order = new Order({
-      cart,
-      user,
-      total
-    });
-
-    const orderDoc = await order.save();
-
-    const cartDoc = await Cart.findById(orderDoc.cart._id).populate({
+    const cartDoc = await Cart.findOne({ _id: req.body.cartId, user }).populate({
       path: 'products.product',
       populate: {
         path: 'brand'
       }
     });
+
+    if (!cartDoc) {
+      return res.status(400).json({ error: 'Cart not found.' });
+    }
+
+    if (await Order.exists({ cart: cartDoc._id })) {
+      return res
+        .status(400)
+        .json({ error: 'An order was already placed for this cart.' });
+    }
+
+    // Total is computed from the stored cart, not trusted from the client
+    const total = parseFloat(
+      cartDoc.products
+        .reduce((sum, item) => sum + item.totalPrice, 0)
+        .toFixed(2)
+    );
+
+    const orderDoc = await new Order({ cart: cartDoc._id, user, total }).save();
 
     const newOrder = {
       _id: orderDoc._id,
@@ -40,7 +49,7 @@ router.post('/add', auth, async (req, res) => {
       products: cartDoc.products
     };
 
-    await mailgun.sendEmail(order.user.email, 'order-confirmation', newOrder);
+    await mailgun.sendEmail(req.user.email, 'order-confirmation', newOrder);
 
     res.status(200).json({
       success: true,
@@ -258,7 +267,17 @@ router.delete('/cancel/:orderId', auth, async (req, res) => {
   try {
     const orderId = req.params.orderId;
 
-    const order = await Order.findOne({ _id: orderId });
+    const query =
+      req.user.role === ROLES.Admin
+        ? { _id: orderId }
+        : { _id: orderId, user: req.user._id };
+
+    const order = await Order.findOne(query);
+
+    if (!order) {
+      return res.status(404).json({ error: 'Order not found.' });
+    }
+
     const foundCart = await Cart.findOne({ _id: order.cart });
 
     increaseQuantity(foundCart.products);
@@ -284,7 +303,26 @@ router.put('/status/item/:itemId', auth, async (req, res) => {
     const status = req.body.status || CART_ITEM_STATUS.Cancelled;
 
     const foundCart = await Cart.findOne({ 'products._id': itemId });
+
+    if (!foundCart) {
+      return res.status(404).json({ error: 'Item not found.' });
+    }
+
+    // Customers may only cancel items in their own cart; other status
+    // changes are reserved for admins and merchants
+    const isStaff = [ROLES.Admin, ROLES.Merchant].includes(req.user.role);
+    const ownsCart = String(foundCart.user) === String(req.user._id);
+
+    if (!isStaff && !(ownsCart && status === CART_ITEM_STATUS.Cancelled)) {
+      return res.status(403).json({ error: 'Not allowed.' });
+    }
+
     const foundCartProduct = foundCart.products.find(p => p._id == itemId);
+
+    // Already cancelled: do not restore stock a second time
+    if (foundCartProduct.status === CART_ITEM_STATUS.Cancelled) {
+      return res.status(400).json({ error: 'Item is already cancelled.' });
+    }
 
     await Cart.updateOne(
       { 'products._id': itemId },

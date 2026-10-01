@@ -8,26 +8,70 @@ const auth = require('../../middleware/auth');
 const store = require('../../utils/store');
 
 router.post('/add', auth, async (req, res) => {
+  const reserved = [];
+
   try {
     const user = req.user._id;
     const items = req.body.products;
 
-    const products = store.caculateItemsSalesTax(items);
+    if (!Array.isArray(items) || items.length === 0) {
+      return res.status(400).json({ error: 'Your cart is empty.' });
+    }
 
-    const cart = new Cart({
-      user,
-      products
-    });
+    const lines = [];
 
-    const cartDoc = await cart.save();
+    for (const item of items) {
+      const quantity = Number(item.quantity);
 
-    decreaseQuantity(products);
+      if (!Number.isInteger(quantity) || quantity < 1) {
+        throw new CheckoutError('Invalid product quantity.');
+      }
+
+      // Price and tax flag always come from the database, never the client
+      const product = await Product.findOne({
+        _id: item.product,
+        isActive: true
+      });
+
+      if (!product) {
+        throw new CheckoutError('A product in your cart is unavailable.');
+      }
+
+      // Atomic reservation: only succeeds while enough stock remains
+      const result = await Product.updateOne(
+        { _id: product._id, quantity: { $gte: quantity } },
+        { $inc: { quantity: -quantity } }
+      );
+
+      if (result.nModified !== 1) {
+        throw new CheckoutError(
+          `Not enough stock for ${product.name}. Please update your cart.`
+        );
+      }
+
+      reserved.push({ product: product._id, quantity });
+      lines.push({
+        product: product._id,
+        quantity,
+        price: product.price,
+        taxable: product.taxable
+      });
+    }
+
+    const products = store.caculateItemsSalesTax(lines);
+    const cartDoc = await new Cart({ user, products }).save();
 
     res.status(200).json({
       success: true,
       cartId: cartDoc.id
     });
   } catch (error) {
+    await releaseStock(reserved);
+
+    if (error instanceof CheckoutError) {
+      return res.status(400).json({ error: error.message });
+    }
+
     res.status(400).json({
       error: 'Your request could not be processed. Please try again.'
     });
@@ -82,17 +126,20 @@ router.delete('/delete/:cartId/:productId', auth, async (req, res) => {
   }
 });
 
-const decreaseQuantity = products => {
-  let bulkOptions = products.map(item => {
-    return {
+class CheckoutError extends Error {}
+
+// Give back stock reserved for a checkout that did not complete
+const releaseStock = async reserved => {
+  if (reserved.length === 0) return;
+
+  await Product.bulkWrite(
+    reserved.map(item => ({
       updateOne: {
         filter: { _id: item.product },
-        update: { $inc: { quantity: -item.quantity } }
+        update: { $inc: { quantity: item.quantity } }
       }
-    };
-  });
-
-  Product.bulkWrite(bulkOptions);
+    }))
+  );
 };
 
 module.exports = router;
